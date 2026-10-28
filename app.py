@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Metaverde ChatGPT Business 自动填写与批量导入提交系统 (防 429 限流强化版)
+Metaverde ChatGPT Business 自动填写与批量导入提交系统 (本地持久化记忆版)
 - 纯 Python 3 原生标准库，零第三方依赖 (无需 pip install)
 - 支持单条测试 & 批量邮箱导入（多行粘贴 / TXT / CSV）
 - 【每单独立随机身份】：每次提交动态生成完全不同的姓名、企业名、电话、官网、业务用途等
-- 【防 429 限流核心架构】：
-  1. 支持自定义 HTTP / SOCKS5 代理池 (可配置本地或动态代理出口)
-  2. 429 自动指数退避重试机制 (检测到限流自动休眠冷却并原位重试)
-  3. 随机时间抖动 (Jitter，模拟真人行为间隔)
-  4. 支持【一键重试失败任务】
+- 【全流程本地记忆功能】：
+  1. 页面刷新自动恢复所有配置参数（代理地址、间隔范围、席位数等）
+  2. 刷新后自动恢复任务队列、已成功项、失败项及当前执行断点
+  3. 支持断点续跑：【▶ 继续未完提交】从上次中断处继续，已成功的绝不重复提交
+  4. 支持【🔄 一键重试失败项】与【🗑️ 清空记忆重新开始】
 """
 
 import sys
@@ -73,7 +73,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Metaverde 批量提交系统 (防 429 限流强化版)</title>
+    <title>Metaverde 批量提交系统 (断点记忆强化版)</title>
     <style>
         :root {
             --bg-color: #0b0f17;
@@ -279,7 +279,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             font-weight: 600;
         }
 
-        /* 429 告警横幅 */
         .defense-box {
             background: rgba(245, 158, 11, 0.08);
             border: 1px solid rgba(245, 158, 11, 0.3);
@@ -297,6 +296,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             display: flex;
             align-items: center;
             gap: 6px;
+        }
+
+        .memory-badge {
+            background: rgba(56, 189, 248, 0.12);
+            color: #38bdf8;
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
         }
 
         .btn-group {
@@ -487,7 +498,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <div class="logo-icon">M</div>
             <div>
                 <div class="logo-title">Metaverde 自动提交系统</div>
-                <div style="font-size:0.75rem;color:var(--text-muted);">ChatGPT Business 批量自动化填报 · 429 频控防御增强版</div>
+                <div style="font-size:0.75rem;color:var(--text-muted);">ChatGPT Business 批量自动化填报 · 断点记忆与状态持久化版</div>
             </div>
         </div>
         <div class="tab-nav">
@@ -501,37 +512,40 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="card">
             <div class="card-title">
                 <span>批量导入邮箱列表</span>
-                <span class="badge-pill" id="importCountBadge">就绪 (0 个)</span>
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <span class="memory-badge" id="memoryIndicator">💾 自动记忆中</span>
+                    <span class="badge-pill" id="importCountBadge">就绪 (0 个)</span>
+                </div>
             </div>
 
             <!-- 动态随机选项 -->
             <div class="checkbox-group">
-                <input type="checkbox" id="enablePerItemRandom" checked>
+                <input type="checkbox" id="enablePerItemRandom" checked onchange="saveConfig()">
                 <label for="enablePerItemRandom">
                     🎲 开启【每单独立随机身份】：每次提交动态生成不同姓名、公司名、官网、电话及用途
                 </label>
             </div>
 
-            <!-- 429 限流防御设置 -->
+            <!-- 429 防限流与代理配置 -->
             <div class="defense-box">
                 <div class="defense-title">
-                    🛡️ 429 防限流与代理配置 (解决单个 IP 频繁提交报错)
+                    🛡️ 429 防限流与代理配置 (配置及进度已自动持久化保存)
                 </div>
                 <div class="form-grid">
                     <div class="form-group full-width">
-                        <label>代理服务器 Proxy（可选，支持 HTTP / SOCKS5，例如 <code>http://127.0.0.1:7890</code>，留空则直连）：</label>
-                        <input type="text" id="proxyUrl" placeholder="如 http://127.0.0.1:7890 或 动态住宅/机房代理 URL">
+                        <label>代理服务器 Proxy（例如 <code>http://127.0.0.1:7890</code>，留空则直连，刷新不丢失）：</label>
+                        <input type="text" id="proxyUrl" placeholder="如 http://127.0.0.1:7890 或 动态代理 URL" oninput="saveConfig()">
                     </div>
                     <div class="form-group">
                         <label>最小提交间隔 (秒)</label>
-                        <input type="number" id="minInterval" value="6" min="1" max="120">
+                        <input type="number" id="minInterval" value="6" min="1" max="120" oninput="saveConfig()">
                     </div>
                     <div class="form-group">
-                        <label>最大随机间隔 (秒，加入时间抖动)</label>
-                        <input type="number" id="maxInterval" value="12" min="1" max="180">
+                        <label>最大随机间隔 (秒，时间抖动)</label>
+                        <input type="number" id="maxInterval" value="12" min="1" max="180" oninput="saveConfig()">
                     </div>
                     <div class="form-group full-width" style="display:flex;align-items:center;gap:8px;">
-                        <input type="checkbox" id="autoCooldown429" checked style="accent-color:var(--warning);width:15px;height:15px;">
+                        <input type="checkbox" id="autoCooldown429" checked style="accent-color:var(--warning);width:15px;height:15px;" onchange="saveConfig()">
                         <label for="autoCooldown429" style="color:#fbbf24;font-weight:600;">
                             遇到 429 时自动休眠冷却 60 秒并原位重试（不浪费当前邮箱）
                         </label>
@@ -548,13 +562,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             <div class="form-group">
                 <label>粘贴邮箱列表：</label>
-                <textarea id="batchTextarea" rows="6" placeholder="alex.morgan@example.com&#10;sarah.connor@cyber.io&#10;david.miller@gmail.com"></textarea>
+                <textarea id="batchTextarea" rows="6" placeholder="alex.morgan@example.com&#10;sarah.connor@cyber.io&#10;david.miller@gmail.com" oninput="handleTextareaInput()"></textarea>
             </div>
 
             <div class="form-grid">
                 <div class="form-group">
                     <label>申请席位数 (Planned Seats)</label>
-                    <select id="batchSeats">
+                    <select id="batchSeats" onchange="saveConfig()">
                         <option value="2" selected>2 Seats (固定)</option>
                         <option value="3-5">3 - 5 Seats</option>
                         <option value="RANDOM">🎲 随机轮询 (2, 3-5, 6-10)</option>
@@ -562,7 +576,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
                 <div class="form-group">
                     <label>国家/地区 (Country)</label>
-                    <select id="batchCountry">
+                    <select id="batchCountry" onchange="saveConfig()">
                         <option value="US" selected>United States (US)</option>
                         <option value="CO">Colombia (CO)</option>
                         <option value="MX">Mexico (MX)</option>
@@ -575,9 +589,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             <div class="btn-group">
                 <button type="button" class="btn-secondary" onclick="loadSampleBatch()">载入示例</button>
-                <button type="button" class="btn-secondary" onclick="clearBatch()">清空</button>
+                <button type="button" class="btn-secondary" onclick="clearBatch()" title="清空当前导入与本地持久化记忆">🗑️ 清空记忆与任务</button>
                 <button type="button" class="btn-primary" id="startBatchBtn" onclick="startBatchProcess()">
-                    <span>▶ 开始批量提交</span>
+                    <span id="startBtnLabel">▶ 开始批量提交</span>
                 </button>
                 <button type="button" class="btn-warning" id="retryFailedBtn" onclick="retryFailedTasks()" style="display:none;">
                     <span>🔄 重试失败项 (<span id="retryFailedCount">0</span>)</span>
@@ -646,7 +660,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
 
             <div class="console-box" id="batchConsole" style="height: 170px;">
-                <div class="log-entry"><span class="log-time">[System]</span> 429 防限流与批量提交系统已就绪...</div>
+                <div class="log-entry"><span class="log-time">[System]</span> 具有持久化记忆的批量引擎已就绪...</div>
             </div>
         </div>
     </div>
@@ -689,7 +703,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         </select>
                     </div>
                     <div class="form-group full-width">
-                        <label>代理 Proxy (可选，单次测试同样生效)</label>
+                        <label>代理 Proxy (可选)</label>
                         <input type="text" id="s_proxy" placeholder="如 http://127.0.0.1:7890">
                     </div>
                     <div class="form-group full-width" style="display:flex;align-items:center;gap:8px;">
@@ -722,6 +736,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 
 <script>
+    const STORAGE_KEY_CONFIG = 'metaverde_config_v2';
+    const STORAGE_KEY_STATE = 'metaverde_state_v2';
+
     const FIRST_NAMES = """ + json.dumps(FIRST_NAMES) + r""";
     const LAST_NAMES = """ + json.dumps(LAST_NAMES) + r""";
     const COMPANY_PREFIXES = """ + json.dumps(COMPANY_PREFIXES) + r""";
@@ -800,6 +817,103 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         return unique;
     }
 
+    // ===== 本地记忆与持久化逻辑 =====
+    function saveConfig() {
+        const config = {
+            proxyUrl: document.getElementById('proxyUrl').value,
+            minInterval: document.getElementById('minInterval').value,
+            maxInterval: document.getElementById('maxInterval').value,
+            autoCooldown429: document.getElementById('autoCooldown429').checked,
+            enablePerItemRandom: document.getElementById('enablePerItemRandom').checked,
+            batchSeats: document.getElementById('batchSeats').value,
+            batchCountry: document.getElementById('batchCountry').value
+        };
+        try {
+            localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(config));
+        } catch(e) {}
+    }
+
+    function loadConfig() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY_CONFIG);
+            if (!raw) return;
+            const c = JSON.parse(raw);
+            if (c.proxyUrl !== undefined) document.getElementById('proxyUrl').value = c.proxyUrl;
+            if (c.minInterval !== undefined) document.getElementById('minInterval').value = c.minInterval;
+            if (c.maxInterval !== undefined) document.getElementById('maxInterval').value = c.maxInterval;
+            if (c.autoCooldown429 !== undefined) document.getElementById('autoCooldown429').checked = c.autoCooldown429;
+            if (c.enablePerItemRandom !== undefined) document.getElementById('enablePerItemRandom').checked = c.enablePerItemRandom;
+            if (c.batchSeats !== undefined) document.getElementById('batchSeats').value = c.batchSeats;
+            if (c.batchCountry !== undefined) document.getElementById('batchCountry').value = c.batchCountry;
+        } catch(e) {}
+    }
+
+    function saveState() {
+        try {
+            const state = {
+                rawText: document.getElementById('batchTextarea').value,
+                batchIndex: batchIndex,
+                successCount: successCount,
+                failedCount: failedCount,
+                batchQueue: batchQueue
+            };
+            localStorage.setItem(STORAGE_KEY_STATE, JSON.stringify(state));
+        } catch(e) {
+            console.warn("Storage save error:", e);
+        }
+    }
+
+    function restoreState() {
+        loadConfig();
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY_STATE);
+            if (!raw) return;
+            const state = JSON.parse(raw);
+
+            if (state.rawText) {
+                document.getElementById('batchTextarea').value = state.rawText;
+                updateImportBadge();
+            }
+
+            if (state.batchQueue && state.batchQueue.length > 0) {
+                batchQueue = state.batchQueue;
+                batchIndex = state.batchIndex || 0;
+                successCount = state.successCount || 0;
+                failedCount = state.failedCount || 0;
+
+                document.getElementById('metricTotal').innerText = batchQueue.length;
+                document.getElementById('metricSuccess').innerText = successCount;
+                document.getElementById('metricFailed').innerText = failedCount;
+                document.getElementById('metricRemaining').innerText = Math.max(0, batchQueue.length - batchIndex);
+
+                const pct = batchQueue.length > 0 ? (batchIndex / batchQueue.length * 100).toFixed(0) : 0;
+                document.getElementById('progressBar').style.width = pct + '%';
+
+                renderTableRows();
+
+                appendLog('batchConsole', `💾 已自动从本地记忆恢复！共 ${batchQueue.length} 个任务 (成功: ${successCount}, 失败: ${failedCount}, 待处理: ${Math.max(0, batchQueue.length - batchIndex)})`, 'success');
+
+                if (batchIndex < batchQueue.length) {
+                    document.getElementById('startBtnLabel').innerText = `▶ 继续未完提交 (从第 ${batchIndex + 1} 个开始)`;
+                } else {
+                    document.getElementById('startBtnLabel').innerText = `▶ 重新开始批量提交`;
+                }
+
+                if (failedCount > 0) {
+                    document.getElementById('retryFailedBtn').style.display = 'inline-flex';
+                    document.getElementById('retryFailedCount').innerText = failedCount;
+                }
+            }
+        } catch(e) {
+            console.warn("Restore state error:", e);
+        }
+    }
+
+    function handleTextareaInput() {
+        updateImportBadge();
+        saveState();
+    }
+
     function handleFileSelect(e) {
         const file = e.target.files[0];
         if (!file) return;
@@ -813,6 +927,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const extracted = extractEmails(merged);
             document.getElementById('importCountBadge').innerText = `已识别 ${extracted.length} 个邮箱`;
             appendLog('batchConsole', `已成功从文件 [${file.name}] 导入并识别出 ${extracted.length} 个有效邮箱！`, 'success');
+            saveState();
         };
         reader.readAsText(file, "UTF-8");
         e.target.value = '';
@@ -823,8 +938,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         const extracted = extractEmails(text);
         document.getElementById('importCountBadge').innerText = `已识别 ${extracted.length} 个邮箱`;
     }
-
-    document.getElementById('batchTextarea').addEventListener('input', updateImportBadge);
 
     function loadSampleBatch() {
         const samples = [
@@ -837,6 +950,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById('batchTextarea').value = samples.join('\n');
         updateImportBadge();
         appendLog('batchConsole', "已载入 5 条示例邮箱数据", "info");
+        saveState();
     }
 
     function clearBatch() {
@@ -844,10 +958,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             alert("请先停止当前运行的任务再清空！");
             return;
         }
+        if (!confirm("确定要清空所有已导入邮箱及本地执行进度记忆吗？")) {
+            return;
+        }
         document.getElementById('batchTextarea').value = "";
+        localStorage.removeItem(STORAGE_KEY_STATE);
         updateImportBadge();
         resetStats();
-        appendLog('batchConsole', "已清空数据", "info");
+        document.getElementById('startBtnLabel').innerText = "▶ 开始批量提交";
+        appendLog('batchConsole', "已清空数据及本地持久化记忆", "info");
     }
 
     let batchQueue = [];
@@ -874,6 +993,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     async function startBatchProcess() {
+        // 如果当前已经有记忆队列且未跑完，直接继续断点
+        if (batchQueue.length > 0 && batchIndex < batchQueue.length) {
+            appendLog('batchConsole', `▶ 正在从记忆断点继续执行 (第 ${batchIndex + 1} / ${batchQueue.length} 个)...`, 'info');
+            resumeQueueExecution();
+            return;
+        }
+
         const rawText = document.getElementById('batchTextarea').value;
         const emails = extractEmails(rawText);
 
@@ -909,17 +1035,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById('metricRemaining').innerText = batchQueue.length;
 
         renderTableRows();
+        saveState();
 
+        resumeQueueExecution();
+    }
+
+    function resumeQueueExecution() {
         isBatchRunning = true;
         isBatchPaused = false;
-        batchIndex = 0;
 
         document.getElementById('startBatchBtn').style.display = 'none';
         document.getElementById('pauseBatchBtn').style.display = 'inline-flex';
         document.getElementById('stopBatchBtn').style.display = 'inline-flex';
 
         const proxy = document.getElementById('proxyUrl').value.trim();
-        appendLog('batchConsole', `批量处理启动，共 ${batchQueue.length} 个任务待提交... ${proxy ? '[代理: ' + proxy + ']' : '[直连模式]'}`, 'info');
+        appendLog('batchConsole', `队列开始处理，剩余 ${batchQueue.length - batchIndex} 个任务待提交... ${proxy ? '[代理: ' + proxy + ']' : '[直连模式]'}`, 'info');
 
         runQueueLoop();
     }
@@ -930,11 +1060,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         batchQueue.forEach(item => {
             const tr = document.createElement('tr');
             tr.id = `row-${item.id}`;
+            const statusLabel = item.status === 'success' ? '成功' : (item.status === 'error' ? '失败' : (item.status === 'running' ? '进行中' : '待处理'));
             tr.innerHTML = `
                 <td>${item.id}</td>
                 <td><strong>${item.email}</strong></td>
                 <td>${item.profile.first_name} ${item.profile.last_name} <span style="color:var(--text-muted);">(${item.profile.organization})</span></td>
-                <td><span class="tag tag-${item.status}" id="tag-${item.id}">${item.status === 'success' ? '成功' : (item.status === 'error' ? '失败' : '待处理')}</span></td>
+                <td><span class="tag tag-${item.status}" id="tag-${item.id}">${statusLabel}</span></td>
                 <td id="code-${item.id}">${item.statusCode}</td>
                 <td id="dur-${item.id}">${item.duration}</td>
             `;
@@ -960,7 +1091,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             const current = batchQueue[batchIndex];
 
-            // 保持最新动态代理与动态身份
+            // 如果当前项已经被标记成功（比如恢复的记录），直接跳过
+            if (current.status === 'success') {
+                batchIndex++;
+                updateMetrics();
+                continue;
+            }
+
             if (enableRandom) {
                 current.profile = generateRandomProfile(current.email, defaults, true);
                 const row = document.getElementById(`row-${current.id}`);
@@ -992,13 +1129,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     updateRowStatus(current.id, 'success', '成功', resData.status_code, duration);
                     appendLog('batchConsole', `✓ [${current.email}] 提交成功 (HTTP ${resData.status_code})`, 'success');
                     batchIndex++;
+                    saveState();
                 } else {
-                    // 遇到 429 检查是否自动休眠退避
                     if (resData.status_code === 429 && autoCooldown) {
-                        appendLog('batchConsole', `⚠️ 触发 429 IP 频率限制！当前 IP 已被短时节流。系统正在自动冷却休眠 45 秒后原位重试...`, 'warn');
+                        appendLog('batchConsole', `⚠️ 触发 429 频控限制！当前 IP 已被短时节流。系统正在自动冷却休眠 45 秒后原位重试...`, 'warn');
                         updateRowStatus(current.id, 'running', '429冷却中');
-                        
-                        // 倒计时 45 秒
+                        saveState();
+
                         for (let sec = 45; sec > 0; sec--) {
                             if (!isBatchRunning) break;
                             if (sec % 10 === 0 || sec <= 5) {
@@ -1007,7 +1144,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                             await new Promise(r => setTimeout(r, 1000));
                         }
                         appendLog('batchConsole', `🔄 冷却完毕，重新尝试提交 [${current.email}]...`, 'info');
-                        // 不递增 batchIndex，继续循环原位重试当前项
                         continue;
                     } else {
                         failedCount++;
@@ -1017,6 +1153,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         updateRowStatus(current.id, 'error', '失败', resData.status_code || 'Err', duration);
                         appendLog('batchConsole', `✕ [${current.email}] 提交失败 (HTTP ${resData.status_code}): ${resData.message}`, 'error');
                         batchIndex++;
+                        saveState();
                     }
                 }
             } catch (err) {
@@ -1028,11 +1165,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 updateRowStatus(current.id, 'error', '异常', 'NetErr', duration);
                 appendLog('batchConsole', `✕ [${current.email}] 网络异常: ${err.message}`, 'error');
                 batchIndex++;
+                saveState();
             }
 
             updateMetrics();
 
-            // 计算包含 Jitter 的随机浮动休眠
             if (batchIndex < batchQueue.length && isBatchRunning) {
                 const randomSleep = (Math.random() * (maxInt - minInt) + minInt).toFixed(1);
                 appendLog('batchConsole', `随机时间抖动休眠 ${randomSleep} 秒以规避风控...`, 'info');
@@ -1076,7 +1213,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
     }
 
-    // 一键重试所有失败项
     async function retryFailedTasks() {
         if (isBatchRunning) {
             alert("任务正在运行中，请先暂停或停止！");
@@ -1090,7 +1226,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         appendLog('batchConsole', `🔄 正在准备重试 ${failedItems.length} 个失败任务...`, 'info');
 
-        // 将失败项重构为新队列
         batchQueue = failedItems.map((item, idx) => ({
             id: idx + 1,
             email: item.email,
@@ -1111,14 +1246,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById('retryFailedBtn').style.display = "none";
 
         renderTableRows();
+        saveState();
 
-        isBatchRunning = true;
-        isBatchPaused = false;
-        document.getElementById('startBatchBtn').style.display = 'none';
-        document.getElementById('pauseBatchBtn').style.display = 'inline-flex';
-        document.getElementById('stopBatchBtn').style.display = 'inline-flex';
-
-        runQueueLoop();
+        resumeQueueExecution();
     }
 
     function togglePauseBatch() {
@@ -1131,6 +1261,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             btnText.innerText = "⏸ 暂停";
             appendLog('batchConsole', "已继续任务队列", 'info');
         }
+        saveState();
     }
 
     function stopBatchProcess() {
@@ -1140,6 +1271,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById('pauseBatchBtn').style.display = 'none';
         document.getElementById('stopBatchBtn').style.display = 'none';
         document.getElementById('pauseBtnText').innerText = "⏸ 暂停";
+        if (batchIndex < batchQueue.length) {
+            document.getElementById('startBtnLabel').innerText = `▶ 继续未完提交 (从第 ${batchIndex + 1} 个开始)`;
+        } else {
+            document.getElementById('startBtnLabel').innerText = `▶ 重新开始批量提交`;
+        }
+        saveState();
     }
 
     function exportResultsCSV() {
@@ -1210,7 +1347,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
     });
 
-    updateImportBadge();
+    // 页面加载完成后自动恢复记忆
+    window.addEventListener('DOMContentLoaded', () => {
+        restoreState();
+    });
 </script>
 
 </body>
@@ -1218,9 +1358,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 """
 
 def build_urllib_opener(proxy_url=None):
-    """
-    配置 HTTP / SOCKS5 代理处理器
-    """
     handlers = []
     if proxy_url and proxy_url.strip():
         p = proxy_url.strip()
@@ -1256,11 +1393,9 @@ def execute_metaverde_submit(profile_data):
         logs.append({"text": f"获取目标网页失败: {str(e)}", "type": "error"})
         return False, 500, f"页面抓取失败: {str(e)}", logs
 
-    # 提取 action_url
     action_match = re.search(r'<form[^>]*action=[\"\']([^\"\']+)[\"\']', html)
     action_url = action_match.group(1) if action_match else DEFAULT_ACTION_URL
 
-    # 提取 _source_context
     source_context_match = re.search(r'name=[\"\']_source_context[\"\'][^>]*value=[\"\']([^\"\']+)[\"\']', html)
     if not source_context_match:
         logs.append({"text": "未在页面中找到 _source_context 动态令牌", "type": "error"})
@@ -1388,9 +1523,9 @@ def run_server():
     server_address = ('0.0.0.0', PORT)
     httpd = HTTPServer(server_address, WebHandler)
     print("=" * 65)
-    print(f"[*] Metaverde 防 429 限流强化版服务已就绪！")
+    print(f"[*] Metaverde 断点记忆与状态持久化服务已就绪！")
     print(f"[*] 访问控制台: http://127.0.0.1:{PORT}")
-    print(f"[*] 核心特性: 支持代理池配置、429 智能冷却自动重试、随机 Jitter、一键重试失败项")
+    print(f"[*] 核心特性: 刷新保留全部进度、支持断点续跑、自动记忆配置与表格状态")
     print("=" * 65)
     try:
         httpd.serve_forever()
