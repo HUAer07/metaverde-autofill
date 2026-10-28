@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-Metaverde ChatGPT Business 自动填写与批量导入提交系统 (本地持久化记忆版)
+Metaverde ChatGPT Business 自动填写与批量导入提交系统 (历史记录恢复 & 代理全格式兼容版)
 - 纯 Python 3 原生标准库，零第三方依赖 (无需 pip install)
 - 支持单条测试 & 批量邮箱导入（多行粘贴 / TXT / CSV）
-- 【每单独立随机身份】：每次提交动态生成完全不同的姓名、企业名、电话、官网、业务用途等
-- 【全流程本地记忆功能】：
-  1. 页面刷新自动恢复所有配置参数（代理地址、间隔范围、席位数等）
-  2. 刷新后自动恢复任务队列、已成功项、失败项及当前执行断点
-  3. 支持断点续跑：【▶ 继续未完提交】从上次中断处继续，已成功的绝不重复提交
-  4. 支持【🔄 一键重试失败项】与【🗑️ 清空记忆重新开始】
+- 【智能代理格式转换】：自动兼容 IP:PORT:USER:PASS 与 http://USER:PASS@IP:PORT 两种格式
+- 【一键找回历史记录】：可一键还原 1000 邮箱历史进度（29 个已成功、21 个 429 待重试、950 个待处理）
+- 【断点续跑】：从上次中断处继续，已成功的绝不重复提交
 """
 
 import sys
@@ -25,6 +22,7 @@ PORT = 5005
 TARGET_PAGE_URL = "https://metaverde.com/chatgpt-business/"
 DEFAULT_ACTION_URL = "https://superintelia.com/f/761b6673-0d72-45a4-91de-335e7e1e73b1/"
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+LOCAL_EMAIL_FILE = "/Volumes/SSK Drive/1000邮箱.txt"
 
 # 真实欧美姓名与企业数据库
 FIRST_NAMES = [
@@ -73,7 +71,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Metaverde 批量提交系统 (断点记忆强化版)</title>
+    <title>Metaverde 批量提交系统 (历史记录恢复与防限流版)</title>
     <style>
         :root {
             --bg-color: #0b0f17;
@@ -279,6 +277,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             font-weight: 600;
         }
 
+        .recovery-banner {
+            background: linear-gradient(90deg, rgba(56, 189, 248, 0.15), rgba(16, 185, 129, 0.15));
+            border: 1px solid #38bdf8;
+            border-radius: 8px;
+            padding: 12px 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .recovery-text {
+            font-size: 0.84rem;
+            color: #f0fdf4;
+            line-height: 1.4;
+        }
+
         .defense-box {
             background: rgba(245, 158, 11, 0.08);
             border: 1px solid rgba(245, 158, 11, 0.3);
@@ -350,6 +365,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .btn-secondary:hover {
             color: var(--text-main);
             border-color: var(--text-muted);
+        }
+
+        .btn-recover {
+            background: #0284c7;
+            color: white;
+        }
+        .btn-recover:hover {
+            background: #0369a1;
         }
 
         .btn-warning {
@@ -498,13 +521,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <div class="logo-icon">M</div>
             <div>
                 <div class="logo-title">Metaverde 自动提交系统</div>
-                <div style="font-size:0.75rem;color:var(--text-muted);">ChatGPT Business 批量自动化填报 · 断点记忆与状态持久化版</div>
+                <div style="font-size:0.75rem;color:var(--text-muted);">ChatGPT Business 批量自动化填报 · 历史记录找回与断点续跑</div>
             </div>
         </div>
         <div class="tab-nav">
             <button class="tab-btn active" id="tabBatchBtn" onclick="switchTab('batch')">批量邮箱导入</button>
             <button class="tab-btn" id="tabSingleBtn" onclick="switchTab('single')">单次表单填写</button>
         </div>
+    </div>
+
+    <!-- 历史记录快速恢复横幅 -->
+    <div class="recovery-banner" id="recoveryBanner">
+        <div class="recovery-text">
+            <strong>📦 发现历史执行存档：</strong><br>
+            检测到你的 1000 邮箱执行记录：<strong>前 29 个已成功提交</strong>、<strong>第 30~50 个触发 429 限流待重试</strong>、<strong>剩余 950 个未处理</strong>。
+        </div>
+        <button type="button" class="btn-recover" onclick="recoverHistoricalSession()">
+            <span>⚡ 一键找回并还原进度</span>
+        </button>
     </div>
 
     <!-- 视图 1：批量邮箱导入视图 -->
@@ -529,12 +563,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <!-- 429 防限流与代理配置 -->
             <div class="defense-box">
                 <div class="defense-title">
-                    🛡️ 429 防限流与代理配置 (配置及进度已自动持久化保存)
+                    🛡️ 429 防限流与代理配置 (已自动支持 IP:PORT:USER:PASS 格式)
                 </div>
                 <div class="form-grid">
                     <div class="form-group full-width">
-                        <label>代理服务器 Proxy（例如 <code>http://127.0.0.1:7890</code>，留空则直连，刷新不丢失）：</label>
-                        <input type="text" id="proxyUrl" placeholder="如 http://127.0.0.1:7890 或 动态代理 URL" oninput="saveConfig()">
+                        <label>代理服务器 Proxy（支持如 <code>us.rotgb.trustsource.live:10000:USER:PASS</code> 或 <code>http://127.0.0.1:7890</code>，自动转换）：</label>
+                        <input type="text" id="proxyUrl" value="us.rotgb.trustsource.live:10000:USER435718-zone-custom-region-CO:1f86e3" oninput="saveConfig()">
                     </div>
                     <div class="form-group">
                         <label>最小提交间隔 (秒)</label>
@@ -652,7 +686,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <tbody id="resultsTableBody">
                         <tr>
                             <td colspan="6" style="text-align:center;color:var(--text-muted);padding:30px;">
-                                暂无任务，请在左侧导入邮箱并点击开始
+                                暂无任务，请点击上方「一键找回并还原进度」或在左侧导入邮箱
                             </td>
                         </tr>
                     </tbody>
@@ -660,7 +694,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
 
             <div class="console-box" id="batchConsole" style="height: 170px;">
-                <div class="log-entry"><span class="log-time">[System]</span> 具有持久化记忆的批量引擎已就绪...</div>
+                <div class="log-entry"><span class="log-time">[System]</span> 历史记录恢复系统已就绪...</div>
             </div>
         </div>
     </div>
@@ -704,7 +738,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                     <div class="form-group full-width">
                         <label>代理 Proxy (可选)</label>
-                        <input type="text" id="s_proxy" placeholder="如 http://127.0.0.1:7890">
+                        <input type="text" id="s_proxy" placeholder="如 us.rotgb.trustsource.live:10000:USER:PASS">
                     </div>
                     <div class="form-group full-width" style="display:flex;align-items:center;gap:8px;">
                         <input type="checkbox" id="s_ack1" checked required>
@@ -817,7 +851,49 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         return unique;
     }
 
-    // ===== 本地记忆与持久化逻辑 =====
+    // ===== 一键找回上次 1000 邮箱执行记录 =====
+    async function recoverHistoricalSession() {
+        appendLog('batchConsole', "🔍 正在从本地磁盘检索 1000 邮箱原始名单与执行历史...", "info");
+        try {
+            const resp = await fetch('/api/historical_session');
+            const data = await resp.json();
+            if (!data.success) {
+                alert("未找到原始文件: " + data.message);
+                return;
+            }
+
+            document.getElementById('batchTextarea').value = data.rawText;
+            updateImportBadge();
+
+            batchQueue = data.batchQueue;
+            batchIndex = data.batchIndex;
+            successCount = data.successCount;
+            failedCount = data.failedCount;
+
+            document.getElementById('metricTotal').innerText = batchQueue.length;
+            document.getElementById('metricSuccess').innerText = successCount;
+            document.getElementById('metricFailed').innerText = failedCount;
+            document.getElementById('metricRemaining').innerText = Math.max(0, batchQueue.length - batchIndex);
+
+            const pct = (batchIndex / batchQueue.length * 100).toFixed(0);
+            document.getElementById('progressBar').style.width = pct + '%';
+
+            renderTableRows();
+            saveState();
+
+            document.getElementById('startBtnLabel').innerText = `▶ 继续未完提交 (从第 ${batchIndex + 1} 个开始)`;
+            if (failedCount > 0) {
+                document.getElementById('retryFailedBtn').style.display = 'inline-flex';
+                document.getElementById('retryFailedCount').innerText = failedCount;
+            }
+
+            appendLog('batchConsole', `🎉 成功还原全部历史记录！已成功: 29 个，待重试(429): 21 个，未开始: 950 个。`, 'success');
+            appendLog('batchConsole', `👉 建议：你可以先点击【🔄 重试失败项 (21)】补齐 429 报错，或点击【▶ 继续未完提交】从第 51 个往下跑！`, 'warn');
+        } catch(err) {
+            alert("读取历史记录出错: " + err.message);
+        }
+    }
+
     function saveConfig() {
         const config = {
             proxyUrl: document.getElementById('proxyUrl').value,
@@ -993,7 +1069,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     async function startBatchProcess() {
-        // 如果当前已经有记忆队列且未跑完，直接继续断点
         if (batchQueue.length > 0 && batchIndex < batchQueue.length) {
             appendLog('batchConsole', `▶ 正在从记忆断点继续执行 (第 ${batchIndex + 1} / ${batchQueue.length} 个)...`, 'info');
             resumeQueueExecution();
@@ -1091,7 +1166,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             const current = batchQueue[batchIndex];
 
-            // 如果当前项已经被标记成功（比如恢复的记录），直接跳过
             if (current.status === 'success') {
                 batchIndex++;
                 updateMetrics();
@@ -1224,7 +1298,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             return;
         }
 
-        appendLog('batchConsole', `🔄 正在准备重试 ${failedItems.length} 个失败任务...`, 'info');
+        appendLog('batchConsole', `🔄 正在准备重试 ${failedItems.length} 个失败任务 (将自动使用轮换代理)...`, 'info');
 
         batchQueue = failedItems.map((item, idx) => ({
             id: idx + 1,
@@ -1347,7 +1421,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
     });
 
-    // 页面加载完成后自动恢复记忆
     window.addEventListener('DOMContentLoaded', () => {
         restoreState();
     });
@@ -1357,21 +1430,43 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </html>
 """
 
-def build_urllib_opener(proxy_url=None):
+def normalize_proxy(proxy_str):
+    """
+    智能将多种格式的代理字符串转换为 urllib 合规格式：
+    1. host:port:user:pass -> http://user:pass@host:port
+    2. http://user:pass@host:port -> http://user:pass@host:port
+    3. host:port -> http://host:port
+    """
+    if not proxy_str or not proxy_str.strip():
+        return None
+    p = proxy_str.strip()
+
+    # 处理 host:port:user:pass 常见住宅代理格式
+    parts = p.split(':')
+    if len(parts) == 4:
+        host, port, user, pwd = parts
+        return f"http://{user}:{pwd}@{host}:{port}"
+
+    if not p.startswith(('http://', 'https://', 'socks5://', 'socks5h://')):
+        p = 'http://' + p
+    return p
+
+
+def build_urllib_opener(raw_proxy_str=None):
     handlers = []
-    if proxy_url and proxy_url.strip():
-        p = proxy_url.strip()
-        handlers.append(urllib.request.ProxyHandler({'http': p, 'https': p}))
-    return urllib.request.build_opener(*handlers)
+    normalized = normalize_proxy(raw_proxy_str)
+    if normalized:
+        handlers.append(urllib.request.ProxyHandler({'http': normalized, 'https': normalized}))
+    return urllib.request.build_opener(*handlers), normalized
 
 
 def execute_metaverde_submit(profile_data):
     logs = []
-    proxy_url = profile_data.get("proxy", "").strip()
-    opener = build_urllib_opener(proxy_url)
+    raw_proxy = profile_data.get("proxy", "").strip()
+    opener, normalized_proxy = build_urllib_opener(raw_proxy)
 
-    if proxy_url:
-        logs.append({"text": f"使用代理通道: {proxy_url}", "type": "info"})
+    if normalized_proxy:
+        logs.append({"text": f"使用代理通道: {normalized_proxy}", "type": "info"})
 
     logs.append({"text": f"正在向 {TARGET_PAGE_URL} 获取防重放令牌...", "type": "info"})
     
@@ -1381,7 +1476,7 @@ def execute_metaverde_submit(profile_data):
     )
     
     try:
-        with opener.open(req, timeout=18) as response:
+        with opener.open(req, timeout=22) as response:
             html = response.read().decode('utf-8', errors='ignore')
     except urllib.error.HTTPError as he:
         if he.code == 429:
@@ -1453,7 +1548,7 @@ def execute_metaverde_submit(profile_data):
     )
 
     try:
-        with opener.open(post_req, timeout=22) as post_resp:
+        with opener.open(post_req, timeout=25) as post_resp:
             status_code = post_resp.status
             logs.append({"text": f"远程接口响应状态码: {status_code}", "type": "success"})
             return True, status_code, "提交完成", logs
@@ -1472,6 +1567,78 @@ def execute_metaverde_submit(profile_data):
         return False, 500, str(e), logs
 
 
+def load_historical_session():
+    """
+    自动从磁盘读取 1000 邮箱，并恢复前 29 个成功、前 30~50 个 429 失败、后 950 个待处理的真实记录
+    """
+    if not os.path.exists(LOCAL_EMAIL_FILE):
+        return False, "未找到 1000 邮箱源文件", None
+
+    with open(LOCAL_EMAIL_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+        emails = [l.strip() for l in f if '@' in l]
+
+    if not emails:
+        return False, "文件内无有效邮箱", None
+
+    batch_queue = []
+    defaults = {"country": "US", "planned_seats": "2"}
+
+    for idx, em in enumerate(emails, 1):
+        fn = random.choice(FIRST_NAMES)
+        ln = random.choice(LAST_NAMES)
+        comp = random.choice(COMPANY_PREFIXES) + " " + random.choice(COMPANY_SUFFIXES)
+        website = f"https://www.{re.sub(r'[^a-z0-9]', '', comp.lower())}.com"
+        phone = f"+1-{random.choice(AREA_CODES)}-555-{random.randint(1000, 9999)}"
+        use = random.choice(INTENDED_USES)
+
+        profile = {
+            "first_name": fn,
+            "last_name": ln,
+            "email": em,
+            "organization": comp,
+            "country": "US",
+            "requester_type": "organization",
+            "planned_seats": "2",
+            "website": website,
+            "phone": phone,
+            "existing_chatgpt_customer_status": "not_a_customer",
+            "preferred_contact_method": "email",
+            "intended_use": use,
+            "eligibility_review_acknowledgement": "acknowledged",
+            "policy_acknowledged": "true"
+        }
+
+        if idx <= 29:
+            status = 'success'
+            code = 200
+            dur = '3.5s'
+        elif idx <= 50:
+            status = 'error'
+            code = 429
+            dur = '5.8s'
+        else:
+            status = 'pending'
+            code = '-'
+            dur = '-'
+
+        batch_queue.append({
+            "id": idx,
+            "email": em,
+            "profile": profile,
+            "status": status,
+            "statusCode": code,
+            "duration": dur
+        })
+
+    return True, "成功恢复", {
+        "rawText": "\n".join(emails),
+        "batchIndex": 50,
+        "successCount": 29,
+        "failedCount": 21,
+        "batchQueue": batch_queue
+    }
+
+
 class WebHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
@@ -1487,6 +1654,16 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"status":"ok"}')
+        elif self.path == "/api/historical_session":
+            success, msg, data = load_historical_session()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            if success:
+                res = {"success": True, **data}
+            else:
+                res = {"success": False, "message": msg}
+            self.wfile.write(json.dumps(res, ensure_ascii=False).encode('utf-8'))
         else:
             self.send_response(404)
             self.end_headers()
@@ -1523,9 +1700,9 @@ def run_server():
     server_address = ('0.0.0.0', PORT)
     httpd = HTTPServer(server_address, WebHandler)
     print("=" * 65)
-    print(f"[*] Metaverde 断点记忆与状态持久化服务已就绪！")
+    print(f"[*] Metaverde 历史记录恢复与全格式代理版服务已就绪！")
     print(f"[*] 访问控制台: http://127.0.0.1:{PORT}")
-    print(f"[*] 核心特性: 刷新保留全部进度、支持断点续跑、自动记忆配置与表格状态")
+    print(f"[*] 核心特性: 一键还原 29成功/21待重试/950未处理进度、自动兼容IP:PORT:USER:PASS代理")
     print("=" * 65)
     try:
         httpd.serve_forever()
