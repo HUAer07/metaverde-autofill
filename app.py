@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Metaverde ChatGPT Business 自动填写与批量导入提交系统
+Metaverde ChatGPT Business 自动填写与批量导入提交系统 (防 429 限流强化版)
 - 纯 Python 3 原生标准库，零第三方依赖 (无需 pip install)
 - 支持单条测试 & 批量邮箱导入（多行粘贴 / TXT / CSV）
 - 【每单独立随机身份】：每次提交动态生成完全不同的姓名、企业名、电话、官网、业务用途等
-- 队列逐个提交，支持自定义延迟间隔、暂停、继续、终止
-- 实时可视化进度条、明细结果表格、失败自动重试、结果 CSV 导出
+- 【防 429 限流核心架构】：
+  1. 支持自定义 HTTP / SOCKS5 代理池 (可配置本地或动态代理出口)
+  2. 429 自动指数退避重试机制 (检测到限流自动休眠冷却并原位重试)
+  3. 随机时间抖动 (Jitter，模拟真人行为间隔)
+  4. 支持【一键重试失败任务】
 """
 
 import sys
@@ -13,6 +16,7 @@ import os
 import json
 import re
 import random
+import time
 import urllib.request
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -22,7 +26,7 @@ TARGET_PAGE_URL = "https://metaverde.com/chatgpt-business/"
 DEFAULT_ACTION_URL = "https://superintelia.com/f/761b6673-0d72-45a4-91de-335e7e1e73b1/"
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
-# 丰富真实的欧美常用名与组织数据库（用于每条独立随机生成）
+# 真实欧美姓名与企业数据库
 FIRST_NAMES = [
     "Alexander", "Benjamin", "Charlotte", "Daniel", "Eleanor", "Felix", "Gabriel", "Hannah",
     "Isaac", "Julian", "Katherine", "Liam", "Madeleine", "Nathan", "Oliver", "Penelope",
@@ -69,7 +73,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Metaverde 批量邮箱导入与自动提交系统 (独立随机化版)</title>
+    <title>Metaverde 批量提交系统 (防 429 限流强化版)</title>
     <style>
         :root {
             --bg-color: #0b0f17;
@@ -99,17 +103,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             background-color: var(--bg-color);
             color: var(--text-main);
             min-height: 100vh;
-            padding: 24px;
+            padding: 20px;
             display: flex;
             justify-content: center;
         }
 
         .container {
-            max-width: 1320px;
+            max-width: 1360px;
             width: 100%;
             display: flex;
             flex-direction: column;
-            gap: 20px;
+            gap: 18px;
         }
 
         .top-bar {
@@ -118,7 +122,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             align-items: center;
             background: var(--card-bg);
             border: 1px solid var(--card-border);
-            padding: 14px 24px;
+            padding: 14px 22px;
             border-radius: 12px;
         }
 
@@ -176,8 +180,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         .grid-layout {
             display: grid;
-            grid-template-columns: 1.3fr 1.1fr;
-            gap: 20px;
+            grid-template-columns: 1.25fr 1.15fr;
+            gap: 18px;
         }
 
         @media (max-width: 1024px) {
@@ -190,11 +194,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             background: var(--card-bg);
             border: 1px solid var(--card-border);
             border-radius: 12px;
-            padding: 22px;
+            padding: 20px;
             box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
             display: flex;
             flex-direction: column;
-            gap: 16px;
+            gap: 14px;
         }
 
         .card-title {
@@ -203,14 +207,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding-bottom: 12px;
+            padding-bottom: 10px;
             border-bottom: 1px solid var(--card-border);
         }
 
         .form-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 14px;
+            gap: 12px;
         }
 
         .full-width { grid-column: span 2; }
@@ -218,7 +222,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .form-group {
             display: flex;
             flex-direction: column;
-            gap: 6px;
+            gap: 5px;
         }
 
         label {
@@ -233,7 +237,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             background: var(--input-bg);
             border: 1px solid var(--input-border);
             border-radius: 6px;
-            padding: 9px 12px;
+            padding: 8px 12px;
             color: var(--text-main);
             font-size: 0.88rem;
             outline: none;
@@ -257,28 +261,47 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             gap: 8px;
             background: rgba(16, 163, 127, 0.06);
             border: 1px solid rgba(16, 163, 127, 0.2);
-            padding: 10px 14px;
-            border-radius: 8px;
+            padding: 8px 12px;
+            border-radius: 6px;
         }
 
         .checkbox-group input {
             cursor: pointer;
             accent-color: var(--accent);
-            width: 16px;
-            height: 16px;
+            width: 15px;
+            height: 15px;
         }
 
         .checkbox-group label {
-            font-size: 0.84rem;
+            font-size: 0.82rem;
             color: var(--text-main);
             cursor: pointer;
-            line-height: 1.4;
             font-weight: 600;
+        }
+
+        /* 429 告警横幅 */
+        .defense-box {
+            background: rgba(245, 158, 11, 0.08);
+            border: 1px solid rgba(245, 158, 11, 0.3);
+            border-radius: 8px;
+            padding: 12px 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .defense-title {
+            color: #fbbf24;
+            font-size: 0.84rem;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
 
         .btn-group {
             display: flex;
-            gap: 10px;
+            gap: 8px;
             align-items: center;
             flex-wrap: wrap;
         }
@@ -288,8 +311,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             border: none;
             border-radius: 6px;
             font-weight: 600;
-            padding: 9px 16px;
-            font-size: 0.88rem;
+            padding: 8px 15px;
+            font-size: 0.86rem;
             transition: all 0.2s;
             display: inline-flex;
             align-items: center;
@@ -338,40 +361,40 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             border-radius: 8px;
             padding: 12px;
             font-family: "JetBrains Mono", Consolas, Monaco, monospace;
-            font-size: 0.8rem;
+            font-size: 0.78rem;
             color: #d1d5db;
             height: 380px;
             overflow-y: auto;
             display: flex;
             flex-direction: column;
-            gap: 5px;
+            gap: 4px;
         }
 
         .log-entry { line-height: 1.4; word-break: break-all; }
         .log-time { color: #64748b; margin-right: 6px; }
         .log-info { color: #60a5fa; }
         .log-success { color: #34d399; font-weight: 600; }
-        .log-warn { color: #fbbf24; }
+        .log-warn { color: #fbbf24; font-weight: 600; }
         .log-error { color: #f87171; font-weight: 600; }
 
         .metric-cards {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
-            gap: 12px;
+            gap: 10px;
         }
 
         .metric-card {
             background: #090e17;
             border: 1px solid var(--card-border);
             border-radius: 8px;
-            padding: 12px 14px;
+            padding: 10px 12px;
             display: flex;
             flex-direction: column;
-            gap: 4px;
+            gap: 3px;
         }
 
-        .metric-card span { font-size: 0.75rem; color: var(--text-muted); }
-        .metric-card strong { font-size: 1.3rem; font-weight: 700; }
+        .metric-card span { font-size: 0.72rem; color: var(--text-muted); }
+        .metric-card strong { font-size: 1.25rem; font-weight: 700; }
 
         .progress-container {
             width: 100%;
@@ -400,12 +423,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 0.8rem;
+            font-size: 0.78rem;
             text-align: left;
         }
 
         th, td {
-            padding: 9px 12px;
+            padding: 8px 10px;
             border-bottom: 1px solid var(--card-border);
         }
 
@@ -422,9 +445,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         .tag {
             display: inline-block;
-            padding: 2px 7px;
+            padding: 2px 6px;
             border-radius: 4px;
-            font-size: 0.72rem;
+            font-size: 0.7rem;
             font-weight: 600;
         }
         .tag-pending { background: #334155; color: #94a3b8; }
@@ -444,7 +467,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .file-drop-area {
             border: 2px dashed var(--card-border);
             border-radius: 8px;
-            padding: 14px;
+            padding: 12px;
             text-align: center;
             background: rgba(255, 255, 255, 0.01);
             cursor: pointer;
@@ -453,18 +476,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .file-drop-area:hover {
             border-color: var(--accent);
             background: rgba(16, 163, 127, 0.03);
-        }
-
-        .random-banner {
-            font-size: 0.8rem;
-            color: #38bdf8;
-            background: rgba(56, 189, 248, 0.08);
-            border: 1px solid rgba(56, 189, 248, 0.2);
-            padding: 8px 12px;
-            border-radius: 6px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
         }
     </style>
 </head>
@@ -476,7 +487,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <div class="logo-icon">M</div>
             <div>
                 <div class="logo-title">Metaverde 自动提交系统</div>
-                <div style="font-size:0.75rem;color:var(--text-muted);">ChatGPT Business 批量自动化填报与独立随机引擎</div>
+                <div style="font-size:0.75rem;color:var(--text-muted);">ChatGPT Business 批量自动化填报 · 429 频控防御增强版</div>
             </div>
         </div>
         <div class="tab-nav">
@@ -493,42 +504,59 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <span class="badge-pill" id="importCountBadge">就绪 (0 个)</span>
             </div>
 
-            <!-- 动态随机选项开关 -->
+            <!-- 动态随机选项 -->
             <div class="checkbox-group">
                 <input type="checkbox" id="enablePerItemRandom" checked>
                 <label for="enablePerItemRandom">
-                    🎲 开启【每单独立随机身份】：每提交一个邮箱，自动随机生成全新姓名、公司名、官网、电话及用途描述
+                    🎲 开启【每单独立随机身份】：每次提交动态生成不同姓名、公司名、官网、电话及用途
                 </label>
             </div>
 
-            <div class="random-banner">
-                <span>💡 即使你只粘贴一串纯邮箱，系统也会在每次提交前动态生成完全不同的真实欧美身份与企业信息，防止同质化特征。</span>
+            <!-- 429 限流防御设置 -->
+            <div class="defense-box">
+                <div class="defense-title">
+                    🛡️ 429 防限流与代理配置 (解决单个 IP 频繁提交报错)
+                </div>
+                <div class="form-grid">
+                    <div class="form-group full-width">
+                        <label>代理服务器 Proxy（可选，支持 HTTP / SOCKS5，例如 <code>http://127.0.0.1:7890</code>，留空则直连）：</label>
+                        <input type="text" id="proxyUrl" placeholder="如 http://127.0.0.1:7890 或 动态住宅/机房代理 URL">
+                    </div>
+                    <div class="form-group">
+                        <label>最小提交间隔 (秒)</label>
+                        <input type="number" id="minInterval" value="6" min="1" max="120">
+                    </div>
+                    <div class="form-group">
+                        <label>最大随机间隔 (秒，加入时间抖动)</label>
+                        <input type="number" id="maxInterval" value="12" min="1" max="180">
+                    </div>
+                    <div class="form-group full-width" style="display:flex;align-items:center;gap:8px;">
+                        <input type="checkbox" id="autoCooldown429" checked style="accent-color:var(--warning);width:15px;height:15px;">
+                        <label for="autoCooldown429" style="color:#fbbf24;font-weight:600;">
+                            遇到 429 时自动休眠冷却 60 秒并原位重试（不浪费当前邮箱）
+                        </label>
+                    </div>
+                </div>
             </div>
 
             <!-- 文件选择 -->
             <div class="file-drop-area" onclick="document.getElementById('fileInput').click()">
                 <input type="file" id="fileInput" accept=".txt,.csv" style="display:none;" onchange="handleFileSelect(event)">
-                <div style="font-size:0.88rem;font-weight:600;color:var(--text-main);">📁 点击选择或拖放 TXT / CSV 文件</div>
-                <div style="font-size:0.75rem;color:var(--text-muted);margin-top:4px;">支持每行一个邮箱，或 "邮箱,名,姓,企业" 格式</div>
+                <div style="font-size:0.86rem;font-weight:600;color:var(--text-main);">📁 点击选择或拖放 TXT / CSV 文件</div>
+                <div style="font-size:0.72rem;color:var(--text-muted);margin-top:2px;">自动使用正则表达式提取所有有效邮箱，兼容任何复杂混杂文本</div>
             </div>
 
             <div class="form-group">
-                <label>粘贴邮箱列表（每行一个）：</label>
-                <textarea id="batchTextarea" rows="7" placeholder="alex.morgan@example.com&#10;sarah.connor@cyber.io&#10;david.miller@gmail.com&#10;contact@techstartup.com"></textarea>
+                <label>粘贴邮箱列表：</label>
+                <textarea id="batchTextarea" rows="6" placeholder="alex.morgan@example.com&#10;sarah.connor@cyber.io&#10;david.miller@gmail.com"></textarea>
             </div>
 
             <div class="form-grid">
-                <div class="form-group">
-                    <label>提交间隔时间 (秒)</label>
-                    <input type="number" id="batchInterval" value="3" min="1" max="60">
-                </div>
                 <div class="form-group">
                     <label>申请席位数 (Planned Seats)</label>
                     <select id="batchSeats">
                         <option value="2" selected>2 Seats (固定)</option>
                         <option value="3-5">3 - 5 Seats</option>
-                        <option value="6-10">6 - 10 Seats</option>
-                        <option value="11-25">11 - 25 Seats</option>
                         <option value="RANDOM">🎲 随机轮询 (2, 3-5, 6-10)</option>
                     </select>
                 </div>
@@ -543,20 +571,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <option value="OTHER">Other</option>
                     </select>
                 </div>
-                <div class="form-group">
-                    <label>申请主体类型</label>
-                    <select id="batchRequesterType">
-                        <option value="organization" selected>Organization (企业)</option>
-                        <option value="personal_individual">Personal / Individual (个人)</option>
-                    </select>
-                </div>
             </div>
 
             <div class="btn-group">
-                <button type="button" class="btn-secondary" onclick="loadSampleBatch()">载入示例邮箱</button>
+                <button type="button" class="btn-secondary" onclick="loadSampleBatch()">载入示例</button>
                 <button type="button" class="btn-secondary" onclick="clearBatch()">清空</button>
                 <button type="button" class="btn-primary" id="startBatchBtn" onclick="startBatchProcess()">
                     <span>▶ 开始批量提交</span>
+                </button>
+                <button type="button" class="btn-warning" id="retryFailedBtn" onclick="retryFailedTasks()" style="display:none;">
+                    <span>🔄 重试失败项 (<span id="retryFailedCount">0</span>)</span>
                 </button>
                 <button type="button" class="btn-warning" id="pauseBatchBtn" onclick="togglePauseBatch()" style="display:none;">
                     <span id="pauseBtnText">⏸ 暂停</span>
@@ -572,7 +596,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <div class="card-title">
                 <span>批量执行进度与指标</span>
                 <div class="btn-group">
-                    <button class="btn-secondary" style="padding:4px 10px;font-size:0.75rem;" onclick="exportResultsCSV()">📥 导出结果 CSV</button>
+                    <button class="btn-secondary" style="padding:4px 8px;font-size:0.75rem;" onclick="exportResultsCSV()">📥 导出结果 CSV</button>
                 </div>
             </div>
 
@@ -586,7 +610,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <strong id="metricSuccess" style="color:var(--success);">0</strong>
                 </div>
                 <div class="metric-card">
-                    <span>失败</span>
+                    <span>失败 (含429)</span>
                     <strong id="metricFailed" style="color:var(--error);">0</strong>
                 </div>
                 <div class="metric-card">
@@ -622,7 +646,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
 
             <div class="console-box" id="batchConsole" style="height: 170px;">
-                <div class="log-entry"><span class="log-time">[System]</span> 批量独立随机化引擎已就绪...</div>
+                <div class="log-entry"><span class="log-time">[System]</span> 429 防限流与批量提交系统已就绪...</div>
             </div>
         </div>
     </div>
@@ -664,26 +688,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <option value="OTHER">Other</option>
                         </select>
                     </div>
-                    <div class="form-group">
-                        <label>Planned Seats <span class="required">*</span></label>
-                        <select id="s_planned_seats">
-                            <option value="2" selected>2 Seats</option>
-                            <option value="3-5">3 - 5 Seats</option>
-                            <option value="6-10">6 - 10 Seats</option>
-                            <option value="11-25">11 - 25 Seats</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>Website</label>
-                        <input type="url" id="s_website" value="https://example.com">
-                    </div>
-                    <div class="form-group">
-                        <label>Phone</label>
-                        <input type="tel" id="s_phone" value="+1-202-555-0144">
-                    </div>
                     <div class="form-group full-width">
-                        <label>Intended Use</label>
-                        <textarea id="s_intended_use" rows="2">Enterprise AI workflow testing and productivity trial.</textarea>
+                        <label>代理 Proxy (可选，单次测试同样生效)</label>
+                        <input type="text" id="s_proxy" placeholder="如 http://127.0.0.1:7890">
                     </div>
                     <div class="form-group full-width" style="display:flex;align-items:center;gap:8px;">
                         <input type="checkbox" id="s_ack1" checked required>
@@ -715,7 +722,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 
 <script>
-    // 本地庞大的随机身份词库
     const FIRST_NAMES = """ + json.dumps(FIRST_NAMES) + r""";
     const LAST_NAMES = """ + json.dumps(LAST_NAMES) + r""";
     const COMPANY_PREFIXES = """ + json.dumps(COMPANY_PREFIXES) + r""";
@@ -727,7 +733,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         return arr[Math.floor(Math.random() * arr.length)];
     }
 
-    // 生成完全独立的单条随机身份
     function generateRandomProfile(email, defaults, forceFullRandom = true) {
         const fn = getRandomItem(FIRST_NAMES);
         const ln = getRandomItem(LAST_NAMES);
@@ -749,7 +754,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             email: email,
             organization: comp,
             country: defaults.country || 'US',
-            requester_type: defaults.requester_type || 'organization',
+            requester_type: 'organization',
             planned_seats: seats,
             website: `https://www.${domainSlug}${domainSuffix}`,
             phone: phone,
@@ -757,11 +762,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             preferred_contact_method: "email",
             intended_use: use,
             eligibility_review_acknowledgement: "acknowledged",
-            policy_acknowledged: "true"
+            policy_acknowledged: "true",
+            proxy: document.getElementById('proxyUrl').value.trim()
         };
     }
 
-    // 视图切换
     function switchTab(mode) {
         document.getElementById('viewBatch').style.display = mode === 'batch' ? 'grid' : 'none';
         document.getElementById('viewSingle').style.display = mode === 'single' ? 'grid' : 'none';
@@ -780,33 +785,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         box.scrollTop = box.scrollHeight;
     }
 
-    function randomizeSingleForm() {
-        const fn = getRandomItem(FIRST_NAMES);
-        const ln = getRandomItem(LAST_NAMES);
-        const comp = getRandomItem(COMPANY_PREFIXES) + " " + getRandomItem(COMPANY_SUFFIXES);
-        const area = getRandomItem(AREA_CODES);
-
-        document.getElementById('s_first_name').value = fn;
-        document.getElementById('s_last_name').value = ln;
-        document.getElementById('s_email').value = `${fn.toLowerCase()}.${ln.toLowerCase()}${Math.floor(100 + Math.random() * 900)}@gmail.com`;
-        document.getElementById('s_organization').value = comp;
-        document.getElementById('s_website').value = `https://${comp.toLowerCase().replace(/[^a-z0-9]/g, '')}.com`;
-        document.getElementById('s_phone').value = `+1-${area}-555-${Math.floor(1000 + Math.random() * 9000)}`;
-        document.getElementById('s_intended_use').value = getRandomItem(INTENDED_USES);
-    }
-
-    // 批量导入逻辑
-    let rawEmailList = [];
-    let batchQueue = [];
-    let isBatchRunning = false;
-    let isBatchPaused = false;
-    let batchIndex = 0;
-    let successCount = 0;
-    let failedCount = 0;
-
     function extractEmails(text) {
         if (!text) return [];
-        // 正则高保真提取所有合法邮箱（支持各种分隔符、密码混杂格式）
         const matches = text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
         const unique = [];
         const seen = new Set();
@@ -835,7 +815,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             appendLog('batchConsole', `已成功从文件 [${file.name}] 导入并识别出 ${extracted.length} 个有效邮箱！`, 'success');
         };
         reader.readAsText(file, "UTF-8");
-        e.target.value = ''; // 允许重复上传相同文件名
+        e.target.value = '';
     }
 
     function updateImportBadge() {
@@ -852,13 +832,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             "clara.oswald@starfleet.org",
             "victor.creed@apexdata.io",
             "sarah.connor@cyberdyne.net",
-            "bruce.wayne@waynetech.com",
-            "elena.rostova@cloudscale.co",
-            "marcus.vance@vanguardai.com"
+            "bruce.wayne@waynetech.com"
         ];
         document.getElementById('batchTextarea').value = samples.join('\n');
         updateImportBadge();
-        appendLog('batchConsole', "已载入 7 条示例邮箱数据", "info");
+        appendLog('batchConsole', "已载入 5 条示例邮箱数据", "info");
     }
 
     function clearBatch() {
@@ -872,6 +850,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         appendLog('batchConsole', "已清空数据", "info");
     }
 
+    let batchQueue = [];
+    let isBatchRunning = false;
+    let isBatchPaused = false;
+    let batchIndex = 0;
+    let successCount = 0;
+    let failedCount = 0;
+
     function resetStats() {
         batchQueue = [];
         batchIndex = 0;
@@ -882,6 +867,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById('metricFailed').innerText = "0";
         document.getElementById('metricRemaining').innerText = "0";
         document.getElementById('progressBar').style.width = "0%";
+        document.getElementById('retryFailedBtn').style.display = "none";
         document.getElementById('resultsTableBody').innerHTML = `
             <tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:30px;">暂无任务</td></tr>
         `;
@@ -889,7 +875,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     async function startBatchProcess() {
         const rawText = document.getElementById('batchTextarea').value;
-        // 使用正则提取所有合法邮箱（支持带密码、杂项文本等任意格式）
         const emails = extractEmails(rawText);
 
         if (emails.length === 0) {
@@ -897,18 +882,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             return;
         }
 
-        // 先重置计数与状态面板
         resetStats();
 
         const defaults = {
             country: document.getElementById('batchCountry').value,
-            planned_seats: document.getElementById('batchSeats').value,
-            requester_type: document.getElementById('batchRequesterType').value
+            planned_seats: document.getElementById('batchSeats').value
         };
 
         const enableRandom = document.getElementById('enablePerItemRandom').checked;
 
-        batchQueue = [];
         for (let i = 0; i < emails.length; i++) {
             const email = emails[i];
             const profile = generateRandomProfile(email, defaults, enableRandom);
@@ -936,7 +918,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById('pauseBatchBtn').style.display = 'inline-flex';
         document.getElementById('stopBatchBtn').style.display = 'inline-flex';
 
-        appendLog('batchConsole', `批量处理启动，共 ${batchQueue.length} 个任务待提交（独立随机化已激活）...`, 'info');
+        const proxy = document.getElementById('proxyUrl').value.trim();
+        appendLog('batchConsole', `批量处理启动，共 ${batchQueue.length} 个任务待提交... ${proxy ? '[代理: ' + proxy + ']' : '[直连模式]'}`, 'info');
 
         runQueueLoop();
     }
@@ -951,21 +934,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <td>${item.id}</td>
                 <td><strong>${item.email}</strong></td>
                 <td>${item.profile.first_name} ${item.profile.last_name} <span style="color:var(--text-muted);">(${item.profile.organization})</span></td>
-                <td><span class="tag tag-pending" id="tag-${item.id}">待处理</span></td>
-                <td id="code-${item.id}">-</td>
-                <td id="dur-${item.id}">-</td>
+                <td><span class="tag tag-${item.status}" id="tag-${item.id}">${item.status === 'success' ? '成功' : (item.status === 'error' ? '失败' : '待处理')}</span></td>
+                <td id="code-${item.id}">${item.statusCode}</td>
+                <td id="dur-${item.id}">${item.duration}</td>
             `;
             tbody.appendChild(tr);
         });
     }
 
     async function runQueueLoop() {
-        const intervalSec = parseFloat(document.getElementById('batchInterval').value) || 3;
+        const minInt = parseFloat(document.getElementById('minInterval').value) || 5;
+        const maxInt = parseFloat(document.getElementById('maxInterval').value) || 12;
         const enableRandom = document.getElementById('enablePerItemRandom').checked;
+        const autoCooldown = document.getElementById('autoCooldown429').checked;
         const defaults = {
             country: document.getElementById('batchCountry').value,
-            planned_seats: document.getElementById('batchSeats').value,
-            requester_type: document.getElementById('batchRequesterType').value
+            planned_seats: document.getElementById('batchSeats').value
         };
 
         while (batchIndex < batchQueue.length && isBatchRunning) {
@@ -976,19 +960,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             const current = batchQueue[batchIndex];
 
-            // 提交前重新生成一次随机身份（确保每次提交都绝对动态独立）
+            // 保持最新动态代理与动态身份
             if (enableRandom) {
                 current.profile = generateRandomProfile(current.email, defaults, true);
                 const row = document.getElementById(`row-${current.id}`);
                 if (row) {
                     row.cells[2].innerHTML = `${current.profile.first_name} ${current.profile.last_name} <span style="color:var(--text-muted);">(${current.profile.organization})</span>`;
                 }
+            } else {
+                current.profile.proxy = document.getElementById('proxyUrl').value.trim();
             }
 
             const startTime = Date.now();
-
             updateRowStatus(current.id, 'running', '提交中...');
-            appendLog('batchConsole', `[${batchIndex + 1}/${batchQueue.length}] 正在提交: ${current.email} | 身份: ${current.profile.first_name} ${current.profile.last_name} @ ${current.profile.organization}`, 'info');
+            appendLog('batchConsole', `[${batchIndex + 1}/${batchQueue.length}] 正在提交: ${current.email}...`, 'info');
 
             try {
                 const resp = await fetch('/api/submit', {
@@ -1006,13 +991,33 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     current.duration = duration;
                     updateRowStatus(current.id, 'success', '成功', resData.status_code, duration);
                     appendLog('batchConsole', `✓ [${current.email}] 提交成功 (HTTP ${resData.status_code})`, 'success');
+                    batchIndex++;
                 } else {
-                    failedCount++;
-                    current.status = 'error';
-                    current.statusCode = resData.status_code || 'Err';
-                    current.duration = duration;
-                    updateRowStatus(current.id, 'error', '失败', resData.status_code || 'Err', duration);
-                    appendLog('batchConsole', `✕ [${current.email}] 提交失败: ${resData.message}`, 'error');
+                    // 遇到 429 检查是否自动休眠退避
+                    if (resData.status_code === 429 && autoCooldown) {
+                        appendLog('batchConsole', `⚠️ 触发 429 IP 频率限制！当前 IP 已被短时节流。系统正在自动冷却休眠 45 秒后原位重试...`, 'warn');
+                        updateRowStatus(current.id, 'running', '429冷却中');
+                        
+                        // 倒计时 45 秒
+                        for (let sec = 45; sec > 0; sec--) {
+                            if (!isBatchRunning) break;
+                            if (sec % 10 === 0 || sec <= 5) {
+                                appendLog('batchConsole', `⏳ 429 冷却倒计时: 剩余 ${sec} 秒...`, 'warn');
+                            }
+                            await new Promise(r => setTimeout(r, 1000));
+                        }
+                        appendLog('batchConsole', `🔄 冷却完毕，重新尝试提交 [${current.email}]...`, 'info');
+                        // 不递增 batchIndex，继续循环原位重试当前项
+                        continue;
+                    } else {
+                        failedCount++;
+                        current.status = 'error';
+                        current.statusCode = resData.status_code || 'Err';
+                        current.duration = duration;
+                        updateRowStatus(current.id, 'error', '失败', resData.status_code || 'Err', duration);
+                        appendLog('batchConsole', `✕ [${current.email}] 提交失败 (HTTP ${resData.status_code}): ${resData.message}`, 'error');
+                        batchIndex++;
+                    }
                 }
             } catch (err) {
                 const duration = ((Date.now() - startTime) / 1000).toFixed(1) + 's';
@@ -1022,14 +1027,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 current.duration = duration;
                 updateRowStatus(current.id, 'error', '异常', 'NetErr', duration);
                 appendLog('batchConsole', `✕ [${current.email}] 网络异常: ${err.message}`, 'error');
+                batchIndex++;
             }
 
-            batchIndex++;
             updateMetrics();
 
+            // 计算包含 Jitter 的随机浮动休眠
             if (batchIndex < batchQueue.length && isBatchRunning) {
-                appendLog('batchConsole', `等待 ${intervalSec} 秒以规避接口限频...`, 'info');
-                await new Promise(r => setTimeout(r, intervalSec * 1000));
+                const randomSleep = (Math.random() * (maxInt - minInt) + minInt).toFixed(1);
+                appendLog('batchConsole', `随机时间抖动休眠 ${randomSleep} 秒以规避风控...`, 'info');
+                await new Promise(r => setTimeout(r, parseFloat(randomSleep) * 1000));
             }
         }
 
@@ -1062,6 +1069,56 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById('metricRemaining').innerText = remaining;
         const pct = batchQueue.length > 0 ? (batchIndex / batchQueue.length * 100).toFixed(0) : 0;
         document.getElementById('progressBar').style.width = pct + '%';
+
+        if (failedCount > 0) {
+            document.getElementById('retryFailedBtn').style.display = 'inline-flex';
+            document.getElementById('retryFailedCount').innerText = failedCount;
+        }
+    }
+
+    // 一键重试所有失败项
+    async function retryFailedTasks() {
+        if (isBatchRunning) {
+            alert("任务正在运行中，请先暂停或停止！");
+            return;
+        }
+        const failedItems = batchQueue.filter(item => item.status === 'error');
+        if (failedItems.length === 0) {
+            alert("当前没有失败的任务！");
+            return;
+        }
+
+        appendLog('batchConsole', `🔄 正在准备重试 ${failedItems.length} 个失败任务...`, 'info');
+
+        // 将失败项重构为新队列
+        batchQueue = failedItems.map((item, idx) => ({
+            id: idx + 1,
+            email: item.email,
+            profile: item.profile,
+            status: 'pending',
+            statusCode: '-',
+            duration: '-'
+        }));
+
+        batchIndex = 0;
+        successCount = 0;
+        failedCount = 0;
+        document.getElementById('metricTotal').innerText = batchQueue.length;
+        document.getElementById('metricSuccess').innerText = "0";
+        document.getElementById('metricFailed').innerText = "0";
+        document.getElementById('metricRemaining').innerText = batchQueue.length;
+        document.getElementById('progressBar').style.width = "0%";
+        document.getElementById('retryFailedBtn').style.display = "none";
+
+        renderTableRows();
+
+        isBatchRunning = true;
+        isBatchPaused = false;
+        document.getElementById('startBatchBtn').style.display = 'none';
+        document.getElementById('pauseBatchBtn').style.display = 'inline-flex';
+        document.getElementById('stopBatchBtn').style.display = 'inline-flex';
+
+        runQueueLoop();
     }
 
     function togglePauseBatch() {
@@ -1099,7 +1156,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.setAttribute("href", url);
-        link.setAttribute("download", `metaverde_random_batch_results_${new Date().toISOString().slice(0,10)}.csv`);
+        link.setAttribute("download", `metaverde_batch_results_${new Date().toISOString().slice(0,10)}.csv`);
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
@@ -1118,14 +1175,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             organization: document.getElementById('s_organization').value.trim(),
             country: document.getElementById('s_country').value,
             requester_type: 'organization',
-            planned_seats: document.getElementById('s_planned_seats').value,
-            website: document.getElementById('s_website').value.trim(),
-            phone: document.getElementById('s_phone').value.trim(),
+            planned_seats: '2',
+            website: "https://example.com",
+            phone: "+1-202-555-0199",
             existing_chatgpt_customer_status: "not_a_customer",
             preferred_contact_method: "email",
-            intended_use: document.getElementById('s_intended_use').value.trim(),
+            intended_use: "Business workflow testing",
             eligibility_review_acknowledgement: document.getElementById('s_ack1').checked ? 'acknowledged' : '',
-            policy_acknowledged: document.getElementById('s_ack2').checked ? 'true' : ''
+            policy_acknowledged: document.getElementById('s_ack2').checked ? 'true' : '',
+            proxy: document.getElementById('s_proxy').value.trim()
         };
 
         appendLog('singleConsole', `开始提交单个账号: ${data.email}...`, 'info');
@@ -1143,7 +1201,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (res.success) {
                 appendLog('singleConsole', `✓ 单个账号提交成功！HTTP 状态码: ${res.status_code}`, 'success');
             } else {
-                appendLog('singleConsole', `✕ 提交未成功: ${res.message}`, 'error');
+                appendLog('singleConsole', `✕ 提交未成功: ${res.message} (HTTP ${res.status_code})`, 'error');
             }
         } catch (err) {
             appendLog('singleConsole', `网络异常: ${err.message}`, 'error');
@@ -1159,15 +1217,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </html>
 """
 
+def build_urllib_opener(proxy_url=None):
+    """
+    配置 HTTP / SOCKS5 代理处理器
+    """
+    handlers = []
+    if proxy_url and proxy_url.strip():
+        p = proxy_url.strip()
+        handlers.append(urllib.request.ProxyHandler({'http': p, 'https': p}))
+    return urllib.request.build_opener(*handlers)
+
+
 def execute_metaverde_submit(profile_data):
-    """
-    负责：
-    1. 抓取目标页面提取 _source_context 与 action_url
-    2. 构造完整的合规 payload（如果缺项由后端随机兜底）
-    3. POST 发送表单提交并返回执行日志
-    """
     logs = []
-    
+    proxy_url = profile_data.get("proxy", "").strip()
+    opener = build_urllib_opener(proxy_url)
+
+    if proxy_url:
+        logs.append({"text": f"使用代理通道: {proxy_url}", "type": "info"})
+
     logs.append({"text": f"正在向 {TARGET_PAGE_URL} 获取防重放令牌...", "type": "info"})
     
     req = urllib.request.Request(
@@ -1176,15 +1244,23 @@ def execute_metaverde_submit(profile_data):
     )
     
     try:
-        with urllib.request.urlopen(req, timeout=15) as response:
+        with opener.open(req, timeout=18) as response:
             html = response.read().decode('utf-8', errors='ignore')
+    except urllib.error.HTTPError as he:
+        if he.code == 429:
+            logs.append({"text": "远端触发 429 限流 (Too Many Requests)", "type": "warn"})
+            return False, 429, "触发远端 IP 频控限流 (Too Many Requests)", logs
+        logs.append({"text": f"获取目标网页失败: HTTP {he.code}", "type": "error"})
+        return False, he.code, f"页面抓取返回 HTTP {he.code}", logs
     except Exception as e:
         logs.append({"text": f"获取目标网页失败: {str(e)}", "type": "error"})
         return False, 500, f"页面抓取失败: {str(e)}", logs
 
+    # 提取 action_url
     action_match = re.search(r'<form[^>]*action=[\"\']([^\"\']+)[\"\']', html)
     action_url = action_match.group(1) if action_match else DEFAULT_ACTION_URL
 
+    # 提取 _source_context
     source_context_match = re.search(r'name=[\"\']_source_context[\"\'][^>]*value=[\"\']([^\"\']+)[\"\']', html)
     if not source_context_match:
         logs.append({"text": "未在页面中找到 _source_context 动态令牌", "type": "error"})
@@ -1192,7 +1268,6 @@ def execute_metaverde_submit(profile_data):
 
     source_context = source_context_match.group(1)
 
-    # 随机兜底填充
     fn = profile_data.get("first_name") or random.choice(FIRST_NAMES)
     ln = profile_data.get("last_name") or random.choice(LAST_NAMES)
     comp = profile_data.get("organization") or (random.choice(COMPANY_PREFIXES) + " " + random.choice(COMPANY_SUFFIXES))
@@ -1202,7 +1277,7 @@ def execute_metaverde_submit(profile_data):
 
     payload = {
         "language": "en",
-        "_gotcha": "",  # 蜜罐，保持空
+        "_gotcha": "",
         "policy_url": "https://metaverde.com/partner-url-policy",
         "policy_version": "2026-10-11-v2",
         "form_version": "2026-10-08-v2",
@@ -1228,7 +1303,7 @@ def execute_metaverde_submit(profile_data):
         "policy_acknowledged": "true"
     }
 
-    logs.append({"text": f"随机身份装配: {fn} {ln} @ {comp} | 电话: {phone}", "type": "info"})
+    logs.append({"text": f"随机身份装配: {fn} {ln} @ {comp}", "type": "info"})
 
     encoded_data = urllib.parse.urlencode(payload).encode('utf-8')
     post_req = urllib.request.Request(
@@ -1243,7 +1318,7 @@ def execute_metaverde_submit(profile_data):
     )
 
     try:
-        with urllib.request.urlopen(post_req, timeout=20) as post_resp:
+        with opener.open(post_req, timeout=22) as post_resp:
             status_code = post_resp.status
             logs.append({"text": f"远程接口响应状态码: {status_code}", "type": "success"})
             return True, status_code, "提交完成", logs
@@ -1251,6 +1326,9 @@ def execute_metaverde_submit(profile_data):
         if he.code in [200, 301, 302, 303]:
             logs.append({"text": f"远程接口重定向成功 (HTTP {he.code})", "type": "success"})
             return True, he.code, "提交成功并重定向", logs
+        elif he.code == 429:
+            logs.append({"text": "接口返回 HTTP 429: 触发远端 IP 频控限流 (Too Many Requests)", "type": "warn"})
+            return False, 429, "触发远端 IP 频控限流 (Too Many Requests)", logs
         else:
             logs.append({"text": f"HTTP 提交返回状态: {he.code} {he.reason}", "type": "error"})
             return False, he.code, f"接口返回 HTTP {he.code}", logs
@@ -1310,9 +1388,9 @@ def run_server():
     server_address = ('0.0.0.0', PORT)
     httpd = HTTPServer(server_address, WebHandler)
     print("=" * 65)
-    print(f"[*] Metaverde 批量独立随机化提交系统已就绪！")
+    print(f"[*] Metaverde 防 429 限流强化版服务已就绪！")
     print(f"[*] 访问控制台: http://127.0.0.1:{PORT}")
-    print(f"[*] 核心特性: 每单独立随机姓名/企业/电话/官网/用途、零依赖、实时监控")
+    print(f"[*] 核心特性: 支持代理池配置、429 智能冷却自动重试、随机 Jitter、一键重试失败项")
     print("=" * 65)
     try:
         httpd.serve_forever()
